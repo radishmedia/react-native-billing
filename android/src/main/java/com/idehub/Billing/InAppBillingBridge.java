@@ -5,10 +5,9 @@ import android.content.Intent;
 import android.util.Log;
 
 import com.anjlab.android.iab.v3.BillingProcessor;
+import com.anjlab.android.iab.v3.PurchaseData;
 import com.anjlab.android.iab.v3.SkuDetails;
 import com.anjlab.android.iab.v3.TransactionDetails;
-import com.anjlab.android.iab.v3.PurchaseData;
-
 import com.facebook.react.bridge.ActivityEventListener;
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
@@ -25,11 +24,16 @@ import java.util.List;
 import java.util.Map;
 
 public class InAppBillingBridge extends ReactContextBaseJavaModule implements ActivityEventListener, BillingProcessor.IBillingHandler {
+    static final String LOG_TAG = "rnbilling";
+
     ReactApplicationContext _reactContext;
     String LICENSE_KEY = null;
     BillingProcessor bp;
     Boolean mShortCircuit = false;
-    static final String LOG_TAG = "rnbilling";
+    int PURCHASE_FLOW_REQUEST_CODE = 32459;
+    int BILLING_RESPONSE_RESULT_OK = 0;
+    String RESPONSE_CODE = "RESPONSE_CODE";
+    HashMap<String, Promise> mPromiseCache = new HashMap<>();
 
     public InAppBillingBridge(ReactApplicationContext reactContext, String licenseKey) {
         super(reactContext);
@@ -67,29 +71,32 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
     }
 
     @ReactMethod
-    public void open(final Promise promise){
-        if (isIabServiceAvailable()) {
-            if (bp == null) {
-                clearPromises();
-                if (putPromise(PromiseConstants.OPEN, promise)) {
-                    try {
-                        bp = new BillingProcessor(_reactContext, LICENSE_KEY, this);
-                    } catch (Exception ex) {
-                        rejectPromise(PromiseConstants.OPEN, "Failure on open: " + ex.getMessage());
-                    }
-                } else {
-                    promise.reject("EUNSPECIFIED", "Previous open operation is not resolved.");
-                }
-            } else {
-                promise.reject("EUNSPECIFIED", "Channel is already open. Call close() on InAppBilling to be able to open().");
+    public void open(final Promise promise) {
+        if (!isIabServiceAvailable()) {
+            promise.reject("E_NO_EMULATOR", "InAppBilling is not available. InAppBilling will not work/test on an emulator, only a physical Android device.");
+            return;
+        }
+
+        if (bp != null) {
+            promise.reject("E_CONNECTION", "Channel is already open. Call close() on InAppBilling to be able to open().");
+            return;
+        }
+
+        clearPromises();
+
+        if (putPromise(PromiseConstants.OPEN, promise)) {
+            try {
+                bp = new BillingProcessor(_reactContext, LICENSE_KEY, this);
+            } catch (Exception ex) {
+                rejectPromise(PromiseConstants.OPEN, "E_CONNECTION", ex.getMessage(), ex);
             }
         } else {
-            promise.reject("EUNSPECIFIED", "InAppBilling is not available. InAppBilling will not work/test on an emulator, only a physical Android device.");
+            promise.reject("E_UNKNOWN", "Previous open operation is not resolved.");
         }
     }
 
     @ReactMethod
-    public void close(final Promise promise){
+    public void close(final Promise promise) {
         if (bp != null) {
             bp.release();
             bp = null;
@@ -100,310 +107,329 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
     }
 
     @ReactMethod
-    public void loadOwnedPurchasesFromGoogle(final Promise promise){
-      if (bp != null) {
-          bp.loadOwnedPurchasesFromGoogle();
-          promise.resolve(true);
-      } else {
-          promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
-      }
+    public void loadOwnedPurchasesFromGoogle(final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        bp.loadOwnedPurchasesFromGoogle();
+        promise.resolve(true);
     }
 
     @Override
     public void onProductPurchased(String productId, TransactionDetails details) {
-        if (details != null && productId.equals(details.purchaseInfo.purchaseData.productId))
-        {
-            try {
-                WritableMap map = mapTransactionDetails(details);
-                resolvePromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, map);
-            } catch (Exception ex) {
-                rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Failure on purchase or subscribe callback: " + ex.getMessage());
-            }
-        } else {
-            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Failure on purchase or subscribe callback. Details were empty.");
+        if (details == null) {
+            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "E_UNKNOWN", "There is no transaction information.", null);
+            return;
         }
+
+        if (!productId.equals(details.purchaseInfo.purchaseData.productId)) {
+            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "E_UNKNOWN", "Product id does not match.", null);
+            return;
+        }
+
+        WritableMap map = mapTransactionDetails(details);
+        resolvePromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, map);
     }
 
     @Override
     public void onBillingError(int errorCode, Throwable error) {
-        if (hasPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE))
-            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Purchase or subscribe failed with error: " + errorCode);
+        if (!hasPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE)) {
+            return;
+        }
+
+        String errorMessage = error == null ? "Could not purchase product." : error.getMessage();
+
+        rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, getResponseCode(errorCode), errorMessage, error);
     }
 
     @ReactMethod
-    public void purchase(final String productId, final String developerPayload, final Promise promise){
-        if (bp != null) {
-            if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
-                boolean purchaseProcessStarted = bp.purchase(getCurrentActivity(), productId, developerPayload);
-                if (!purchaseProcessStarted)
-                    rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Could not start purchase process.");
-            } else {
-                promise.reject("EUNSPECIFIED", "Previous purchase or subscribe operation is not resolved.");
-            }
+    public void purchase(final String productId, final String developerPayload, final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
+            boolean purchaseProcessStarted = bp.purchase(getCurrentActivity(), productId, developerPayload);
+            if (!purchaseProcessStarted)
+                rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "E_UNKNOWN", "Could not start purchase process.", null);
         } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+            promise.reject("E_UNKNOWN", "Previous purchase or subscribe operation is not resolved.");
         }
     }
 
     @ReactMethod
     public void consumePurchase(final String productId, final Promise promise) {
-        if (bp != null) {
-            try {
-                boolean consumed = bp.consumePurchase(productId);
-                if (consumed)
-                    promise.resolve(true);
-                else
-                    promise.reject("EUNSPECIFIED", "Could not consume purchase");
-            } catch (Exception ex) {
-                promise.reject("EUNSPECIFIED", "Failure on consume: " + ex.getMessage());
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        try {
+            boolean consumed = bp.consumePurchase(productId);
+            if (consumed)
+                promise.resolve(true);
+            else
+                promise.reject("E_UNKNOWN", "Could not consume purchase");
+        } catch (Exception ex) {
+            promise.reject("E_UNKNOWN", ex.getMessage(), ex);
+        }
+    }
+
+    @ReactMethod
+    public void subscribe(final String productId, final String developerPayload, final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
+            boolean subscribeProcessStarted = bp.subscribe(getCurrentActivity(), productId, developerPayload);
+            if (!subscribeProcessStarted)
+                rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "E_UNKNOWN", "Could not start subscribe process.", null);
+        } else {
+            promise.reject("E_UNKNOWN", "Previous subscribe or purchase operation is not resolved.");
+        }
+    }
+
+    @ReactMethod
+    public void updateSubscription(final ReadableArray oldProductIds, final String productId, final String developerPayload, final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
+            ArrayList<String> oldProductIdList = new ArrayList<>();
+            for (int i = 0; i < oldProductIds.size(); i++) {
+                oldProductIdList.add(oldProductIds.getString(i));
             }
+
+            boolean updateProcessStarted = bp.updateSubscription(getCurrentActivity(), oldProductIdList, productId, developerPayload);
+
+            if (!updateProcessStarted)
+                rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "E_UNKNOWN", "Could not start subscribe process.", null);
         } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+            promise.reject("E_UNKNOWN", "Previous subscribe or purchase operation is not resolved.");
         }
     }
 
     @ReactMethod
-    public void subscribe(final String productId, final String developerPayload, final Promise promise){
-        if (bp != null) {
-            if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
-                boolean subscribeProcessStarted = bp.subscribe(getCurrentActivity(), productId, developerPayload);
-                if (!subscribeProcessStarted)
-                    rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Could not start subscribe process.");
-            } else {
-                promise.reject("EUNSPECIFIED", "Previous subscribe or purchase operation is not resolved.");
-            }
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+    public void isSubscribed(final String productId, final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
         }
+
+        boolean subscribed = bp.isSubscribed(productId);
+        promise.resolve(subscribed);
     }
 
     @ReactMethod
-    public void updateSubscription(final ReadableArray oldProductIds, final String productId, final String developerPayload, final Promise promise){
-        if (bp != null) {
-            if (putPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, promise)) {
-                ArrayList<String> oldProductIdList = new ArrayList<>();
-                for (int i = 0; i < oldProductIds.size(); i++) {
-                    oldProductIdList.add(oldProductIds.getString(i));
-                }
-
-                boolean updateProcessStarted = bp.updateSubscription(getCurrentActivity(), oldProductIdList, productId, developerPayload);
-
-                if (!updateProcessStarted)
-                    rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "Could not start updateSubscription process.");
-            } else {
-                promise.reject("EUNSPECIFIED", "Previous subscribe or purchase operation is not resolved.");
-            }
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+    public void isPurchased(final String productId, final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
         }
+
+        boolean purchased = bp.isPurchased(productId);
+        promise.resolve(purchased);
     }
 
     @ReactMethod
-    public void isSubscribed(final String productId, final Promise promise){
-        if (bp != null) {
-            boolean subscribed = bp.isSubscribed(productId);
-            promise.resolve(subscribed);
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+    public void isOneTimePurchaseSupported(final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
         }
-    }
 
-    @ReactMethod
-    public void isPurchased(final String productId, final Promise promise){
-        if (bp != null) {
-            boolean purchased = bp.isPurchased(productId);
-            promise.resolve(purchased);
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
-        }
-    }
-
-    @ReactMethod
-    public void isOneTimePurchaseSupported(final Promise promise){
-        if (bp != null) {
-            boolean oneTimePurchaseSupported = bp.isOneTimePurchaseSupported();
-            promise.resolve(oneTimePurchaseSupported);
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
-        }
+        boolean oneTimePurchaseSupported = bp.isOneTimePurchaseSupported();
+        promise.resolve(oneTimePurchaseSupported);
     }
 
     @ReactMethod
     public void isValidTransactionDetails(final String productId, final Promise promise) {
-        if (bp != null) {
-            try {
-                TransactionDetails details = bp.getPurchaseTransactionDetails(productId);
-                promise.resolve(bp.isValidTransactionDetails(details));
-            } catch (Exception ex) {
-                promise.reject("EUNSPECIFIED", "Failed to validate transaction details: " + ex.getMessage());
-            }
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        try {
+            TransactionDetails details = bp.getPurchaseTransactionDetails(productId);
+            promise.resolve(bp.isValidTransactionDetails(details));
+        } catch (Exception ex) {
+            promise.reject("E_UNKNOWN", "Could not validate transaction details", ex);
         }
     }
 
     @ReactMethod
-    public void listOwnedProducts(final Promise promise){
-        if (bp != null) {
-            List<String> purchasedProductIds = bp.listOwnedProducts();
-            WritableArray arr = Arguments.createArray();
-
-            for (int i = 0; i < purchasedProductIds.size(); i++) {
-                arr.pushString(purchasedProductIds.get(i));
-            }
-
-            promise.resolve(arr);
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+    public void listOwnedProducts(final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
         }
+
+        List<String> purchasedProductIds = bp.listOwnedProducts();
+        WritableArray arr = Arguments.createArray();
+
+        for (int i = 0; i < purchasedProductIds.size(); i++) {
+            arr.pushString(purchasedProductIds.get(i));
+        }
+
+        promise.resolve(arr);
     }
 
     @ReactMethod
-    public void listOwnedSubscriptions(final Promise promise){
-        if (bp != null) {
-            List<String> ownedSubscriptionsIds = bp.listOwnedSubscriptions();
-            WritableArray arr = Arguments.createArray();
-
-            for (int i = 0; i < ownedSubscriptionsIds.size(); i++) {
-                arr.pushString(ownedSubscriptionsIds.get(i));
-            }
-
-            promise.resolve(arr);
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+    public void listOwnedSubscriptions(final Promise promise) {
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
         }
+
+        List<String> ownedSubscriptionsIds = bp.listOwnedSubscriptions();
+        WritableArray arr = Arguments.createArray();
+
+        for (int i = 0; i < ownedSubscriptionsIds.size(); i++) {
+            arr.pushString(ownedSubscriptionsIds.get(i));
+        }
+
+        promise.resolve(arr);
     }
 
     @ReactMethod
     public void getProductDetails(final ReadableArray productIds, final Promise promise) {
-        if (bp != null) {
-            try {
-                ArrayList<String> productIdList = new ArrayList<>();
-                for (int i = 0; i < productIds.size(); i++) {
-                    productIdList.add(productIds.getString(i));
-                }
+        if (bp == null) {
+            promise.reject("E_CONNECTION", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
 
-                List<SkuDetails> details = bp.getPurchaseListingDetails(productIdList);
-
-                if (details != null) {
-                    WritableArray arr = Arguments.createArray();
-                    for (SkuDetails detail : details) {
-                        if (detail != null) {
-                            WritableMap map = Arguments.createMap();
-
-                            map.putString("productId", detail.productId);
-                            map.putString("title", detail.title);
-                            map.putString("description", detail.description);
-                            map.putBoolean("isSubscription", detail.isSubscription);
-                            map.putString("currency", detail.currency);
-                            map.putDouble("priceValue", detail.priceValue);
-                            map.putString("priceText", detail.priceText);
-                            arr.pushMap(map);
-                        }
-                    }
-
-                    promise.resolve(arr);
-                } else {
-                    promise.reject("EUNSPECIFIED", "Details was not found.");
-                }
-            } catch (Exception ex) {
-                promise.reject("EUNSPECIFIED", "Failure on getting product details: " + ex.getMessage());
+        try {
+            ArrayList<String> productIdList = new ArrayList<>();
+            for (int i = 0; i < productIds.size(); i++) {
+                productIdList.add(productIds.getString(i));
             }
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+
+            List<SkuDetails> details = bp.getPurchaseListingDetails(productIdList);
+
+            if (details != null) {
+                WritableArray arr = Arguments.createArray();
+                for (SkuDetails detail : details) {
+                    if (detail != null) {
+                        WritableMap map = Arguments.createMap();
+
+                        map.putString("productId", detail.productId);
+                        map.putString("title", detail.title);
+                        map.putString("description", detail.description);
+                        map.putBoolean("isSubscription", detail.isSubscription);
+                        map.putString("currency", detail.currency);
+                        map.putDouble("priceValue", detail.priceValue);
+                        map.putString("priceText", detail.priceText);
+                        arr.pushMap(map);
+                    }
+                }
+
+                promise.resolve(arr);
+            } else {
+                promise.reject("E_UNKNOWN", "Could not find product details.");
+            }
+        } catch (Exception ex) {
+            promise.reject("E_UNKNOWN", "Could not get product details.", ex);
         }
     }
 
     @ReactMethod
     public void getSubscriptionDetails(final ReadableArray productIds, final Promise promise) {
-        if (bp != null) {
-            try {
-                ArrayList<String> productIdList = new ArrayList<>();
-                for (int i = 0; i < productIds.size(); i++) {
-                    productIdList.add(productIds.getString(i));
-                }
+        if (bp == null) {
+            promise.reject("E_UNKNOWN", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
 
-                List<SkuDetails> details = bp.getSubscriptionListingDetails(productIdList);
-
-                if (details != null) {
-                    WritableArray arr = Arguments.createArray();
-                    for (SkuDetails detail : details) {
-                        if (detail != null) {
-                            WritableMap map = Arguments.createMap();
-
-                            map.putString("productId", detail.productId);
-                            map.putString("title", detail.title);
-                            map.putString("description", detail.description);
-                            map.putBoolean("isSubscription", detail.isSubscription);
-                            map.putString("currency", detail.currency);
-                            map.putDouble("priceValue", detail.priceValue);
-                            map.putString("priceText", detail.priceText);
-                            map.putString("subscriptionPeriod", detail.subscriptionPeriod);
-                            if (detail.subscriptionFreeTrialPeriod != null)
-                                map.putString("subscriptionFreeTrialPeriod", detail.subscriptionFreeTrialPeriod);
-                            map.putBoolean("haveTrialPeriod", detail.haveTrialPeriod);
-                            map.putDouble("introductoryPriceValue", detail.introductoryPriceValue);
-                            if (detail.introductoryPriceText != null)
-                                map.putString("introductoryPriceText", detail.introductoryPriceText);
-                            if (detail.introductoryPricePeriod != null)
-                                map.putString("introductoryPricePeriod", detail.introductoryPricePeriod);
-                            map.putBoolean("haveIntroductoryPeriod", detail.haveIntroductoryPeriod);
-                            map.putInt("introductoryPriceCycles", detail.introductoryPriceCycles);
-                            arr.pushMap(map);
-                        }
-                    }
-
-                    promise.resolve(arr);
-                } else {
-                    promise.reject("EUNSPECIFIED", "Details was not found.");
-                }
-            } catch (Exception ex) {
-                promise.reject("EUNSPECIFIED", "Failure on getting product details: " + ex.getMessage());
+        try {
+            ArrayList<String> productIdList = new ArrayList<>();
+            for (int i = 0; i < productIds.size(); i++) {
+                productIdList.add(productIds.getString(i));
             }
-        } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+
+            List<SkuDetails> details = bp.getSubscriptionListingDetails(productIdList);
+
+            if (details != null) {
+                WritableArray arr = Arguments.createArray();
+                for (SkuDetails detail : details) {
+                    if (detail != null) {
+                        WritableMap map = Arguments.createMap();
+
+                        map.putString("productId", detail.productId);
+                        map.putString("title", detail.title);
+                        map.putString("description", detail.description);
+                        map.putBoolean("isSubscription", detail.isSubscription);
+                        map.putString("currency", detail.currency);
+                        map.putDouble("priceValue", detail.priceValue);
+                        map.putString("priceText", detail.priceText);
+                        map.putString("subscriptionPeriod", detail.subscriptionPeriod);
+                        if (detail.subscriptionFreeTrialPeriod != null)
+                            map.putString("subscriptionFreeTrialPeriod", detail.subscriptionFreeTrialPeriod);
+                        map.putBoolean("haveTrialPeriod", detail.haveTrialPeriod);
+                        map.putDouble("introductoryPriceValue", detail.introductoryPriceValue);
+                        if (detail.introductoryPriceText != null)
+                            map.putString("introductoryPriceText", detail.introductoryPriceText);
+                        if (detail.introductoryPricePeriod != null)
+                            map.putString("introductoryPricePeriod", detail.introductoryPricePeriod);
+                        map.putBoolean("haveIntroductoryPeriod", detail.haveIntroductoryPeriod);
+                        map.putInt("introductoryPriceCycles", detail.introductoryPriceCycles);
+                        arr.pushMap(map);
+                    }
+                }
+
+                promise.resolve(arr);
+            } else {
+                promise.reject("E_UNKNOWN", "Could not find subscription details.");
+            }
+        } catch (Exception ex) {
+            promise.reject("E_UNKNOWN", "Could not get subscription details.", ex);
         }
     }
 
     @ReactMethod
     public void getPurchaseTransactionDetails(final String productId, final Promise promise) {
-        if (bp != null) {
-            TransactionDetails details = bp.getPurchaseTransactionDetails(productId);
-            if (details != null && productId.equals(details.purchaseInfo.purchaseData.productId))
-            {
-                  WritableMap map = mapTransactionDetails(details);
-                  promise.resolve(map);
-            } else {
-                promise.reject("EUNSPECIFIED", "Could not find transaction details for productId.");
-            }
+        if (bp == null) {
+            promise.reject("E_UNKNOWN", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        TransactionDetails details = bp.getPurchaseTransactionDetails(productId);
+        if (details != null && productId.equals(details.purchaseInfo.purchaseData.productId)) {
+            WritableMap map = mapTransactionDetails(details);
+            promise.resolve(map);
         } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+            promise.reject("E_UNKNOWN", "Could not find transaction details for product id.");
         }
     }
 
     @ReactMethod
     public void getSubscriptionTransactionDetails(final String productId, final Promise promise) {
-        if (bp != null) {
-            TransactionDetails details = bp.getSubscriptionTransactionDetails(productId);
-            if (details != null && productId.equals(details.purchaseInfo.purchaseData.productId))
-            {
-                  WritableMap map = mapTransactionDetails(details);
-                  promise.resolve(map);
-            } else {
-                promise.reject("EUNSPECIFIED", "Could not find transaction details for productId.");
-            }
+        if (bp == null) {
+            promise.reject("E_UNKNOWN", "Channel is not opened. Call open() on InAppBilling.");
+            return;
+        }
+
+        TransactionDetails details = bp.getSubscriptionTransactionDetails(productId);
+        if (details != null && productId.equals(details.purchaseInfo.purchaseData.productId)) {
+            WritableMap map = mapTransactionDetails(details);
+            promise.resolve(map);
         } else {
-            promise.reject("EUNSPECIFIED", "Channel is not opened. Call open() on InAppBilling.");
+            promise.reject("E_UNKNOWN", "Could not find transaction details for product id.");
         }
     }
 
     private WritableMap mapTransactionDetails(TransactionDetails details) {
         WritableMap map = Arguments.createMap();
 
-        map.putString("receiptData", details.purchaseInfo.responseData.toString());
+        map.putString("receiptData", details.purchaseInfo.responseData);
 
         if (details.purchaseInfo.signature != null)
-            map.putString("receiptSignature", details.purchaseInfo.signature.toString());
+            map.putString("receiptSignature", details.purchaseInfo.signature);
 
         PurchaseData purchaseData = details.purchaseInfo.purchaseData;
 
@@ -411,13 +437,14 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
         map.putString("orderId", purchaseData.orderId);
         map.putString("purchaseToken", purchaseData.purchaseToken);
         map.putString("purchaseTime", purchaseData.purchaseTime == null
-          ? "" : purchaseData.purchaseTime.toString());
+                ? "" : purchaseData.purchaseTime.toString());
         map.putString("purchaseState", purchaseData.purchaseState == null
-          ? "" : purchaseData.purchaseState.toString());
+                ? "" : purchaseData.purchaseState.toString());
         map.putBoolean("autoRenewing", purchaseData.autoRenewing);
 
-        if (purchaseData.developerPayload != null)
+        if (purchaseData.developerPayload != null) {
             map.putString("developerPayload", purchaseData.developerPayload);
+        }
 
         return map;
     }
@@ -440,18 +467,15 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
             return;
         }
 
-        if (bp != null)
+        if (bp != null) {
             bp.handleActivityResult(requestCode, resultCode, intent);
+        }
     }
 
     @ReactMethod
     public void shortCircuitPurchaseFlow(final Boolean enable) {
         mShortCircuit = enable;
     }
-
-    int PURCHASE_FLOW_REQUEST_CODE = 32459;
-    int BILLING_RESPONSE_RESULT_OK = 0;
-    String RESPONSE_CODE = "RESPONSE_CODE";
 
     private void shortCircuitActivityResult(final Activity activity, final int requestCode, final int resultCode, final Intent intent) {
         if (requestCode != PURCHASE_FLOW_REQUEST_CODE) {
@@ -462,16 +486,14 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
         if (resultCode == Activity.RESULT_OK && responseCode == BILLING_RESPONSE_RESULT_OK) {
             resolvePromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, true);
         } else {
-            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, "An error has occured. Code " + requestCode);
+            rejectPromise(PromiseConstants.PURCHASE_OR_SUBSCRIBE, getResponseCode(responseCode), "An error has occurred. Code: " + requestCode, null);
         }
     }
 
     @Override
-    public void onNewIntent(Intent intent){
+    public void onNewIntent(Intent intent) {
 
     }
-
-    HashMap<String, Promise> mPromiseCache = new HashMap<>();
 
     synchronized void resolvePromise(String key, Object value) {
         if (mPromiseCache.containsKey(key)) {
@@ -483,10 +505,10 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
         }
     }
 
-    synchronized void rejectPromise(String key, String reason) {
+    synchronized void rejectPromise(String key, String code, String reason, Throwable throwable) {
         if (mPromiseCache.containsKey(key)) {
             Promise promise = mPromiseCache.get(key);
-            promise.reject("EUNSPECIFIED", reason);
+            promise.reject(code, reason, throwable);
             mPromiseCache.remove(key);
         } else {
             Log.w(LOG_TAG, String.format("Tried to reject promise: %s - but does not exist in cache", key));
@@ -509,5 +531,27 @@ public class InAppBillingBridge extends ReactContextBaseJavaModule implements Ac
 
     synchronized void clearPromises() {
         mPromiseCache.clear();
+    }
+
+    // https://developer.android.com/google/play/billing/billing_reference
+    synchronized String getResponseCode(Integer code) {
+        final Map<Integer, String> constants = new HashMap<>();
+
+        constants.put(1, "E_USER_CANCELED");
+        constants.put(2, "E_SERVICE_UNAVAILABLE");
+        constants.put(3, "E_BILLING_UNAVAILABLE");
+        constants.put(4, "E_ITEM_UNAVAILABLE");
+        constants.put(5, "E_DEVELOPER_ERROR");
+        constants.put(6, "E_API_ERROR");
+        constants.put(7, "E_ITEM_ALREADY_OWNED");
+        constants.put(8, "E_ITEM_NOT_OWNED");
+
+        if (!constants.containsKey(code)) {
+            return "E_UNKNOWN";
+        }
+
+        String resCode = constants.get(code);
+
+        return resCode;
     }
 }
